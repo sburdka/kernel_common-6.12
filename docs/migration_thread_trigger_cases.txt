@@ -1,0 +1,241 @@
+Migration Thread (migration/N / cpu_stopper) — When It Runs
+=============================================================
+Linux kernel 6.12  |  Generated: 2026-05-13
+
+The per-CPU kernel thread "migration/N" (one per logical CPU) is the
+cpu_stopper thread.  It executes work items queued via cpu_stop_queue_work()
+and its wrappers.  Every case below ultimately queues a callback (fn) to one
+or more stopper threads.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CATEGORY 1 — TASK MIGRATION (scheduler)
+----------------------------------------
+Callback: migration_cpu_stop()
+Source:   kernel/sched/core.c
+
+1.1  sched_exec()
+     Triggered when a task calls exec() (execve/execveat).
+     The kernel may migrate the new process to the most idle CPU for
+     better cache locality at program start.
+     API used: stop_one_cpu()
+
+1.2  sched_setaffinity() / __set_cpus_allowed_ptr()
+     Triggered when userspace writes /proc/<pid>/cpuset, calls
+     sched_setaffinity(2), or the kernel changes a thread's allowed CPU mask
+     (e.g. cpuset subsystem, IRQ affinity helpers).
+     Migrates the task if its current CPU is no longer in the new mask.
+     API used: stop_one_cpu()
+
+1.3  migrate_task_to() — explicit CPU pinning
+     Called by: cpufreq governors (schedutil), thermal pressure balancers,
+     EAS (Energy Aware Scheduler) placement, and sched_setattr(SCHED_DEADLINE).
+     API used: stop_one_cpu()
+
+1.4  __migrate_task() — bulk / hotplug migration
+     Called during CPU offline to drain all tasks off the departing CPU.
+     Also called by migrate_tasks() during CPU teardown.
+     API used: stop_one_cpu()
+
+1.5  RT task push/pull — migrate_enable() / rt_mutex_setprio()
+     When a SCHED_FIFO/SCHED_RR task is unblocked on the wrong CPU, or
+     priority inheritance changes the effective priority, the RT balancer
+     may push it to another CPU via the stopper.
+     API used: stop_one_cpu_nowait()
+
+1.6  Deadline task migration (SCHED_DEADLINE)
+     dl_task_timer() and the DL push/pull logic migrate overloaded deadline
+     tasks to other CPUs to meet their deadlines.
+     API used: stop_one_cpu_nowait()
+
+
+CATEGORY 2 — ACTIVE LOAD BALANCING (CFS)
+------------------------------------------
+Callback: active_load_balance_cpu_stop()
+Source:   kernel/sched/fair.c
+
+2.1  load_balance() → active_load_balance_cpu_stop()
+     The CFS load balancer detects a CPU-bound task that the idle balancer
+     cannot migrate (task is currently running).  It queues an active
+     migration to pull that task off the overloaded CPU.
+     Frequency: every scheduler tick on overloaded systems.
+     API used: stop_one_cpu_nowait()
+
+2.2  nohz_idle_balance() / rebalance_domains()
+     When a CPU goes idle and the NO_HZ tick is suppressed, the idle CPU
+     performs load balancing on behalf of busy CPUs.  Tasks that are
+     currently running cannot be pulled passively; the stopper is used.
+     API used: stop_one_cpu_nowait()
+
+
+CATEGORY 3 — stop_machine() CALLS (global freeze)
+---------------------------------------------------
+Callback: multi_cpu_stop()  [state machine: PREPARE→DISABLE_IRQ→RUN→EXIT]
+Source:   kernel/stop_machine.c
+
+All CPUs enter multi_cpu_stop() simultaneously.  Only the "active" CPU
+executes the payload fn().  All others spin with IRQs disabled until done.
+
+3.1  jump_label_update_all()           — kernel/jump_label.c
+     Updates all static-key branch sites (nop ↔ jump) in one shot.
+     Called at boot and whenever a static key changes.
+
+3.2  apply_alternatives()              — arch/arm64/kernel/alternative.c
+                                         arch/x86/kernel/alternative.c
+     Patches alternative instruction sequences (e.g. CPU errata workarounds,
+     KPTI, retpoline, MTE, etc.) at boot and during module load.
+
+3.3  text_poke_bp_batch()              — arch/x86/kernel/alternative.c
+     x86 breakpoint-based instruction patching (kprobes, ftrace, live patch).
+     Uses a 3-step INT3→sync→final-patch sequence; stop_machine is the sync.
+
+3.4  static_call_update() / __static_call_update()
+                                        — kernel/static_call.c
+     Updates static call sites (trampoline patching).
+     Called when a static_call target is changed at runtime.
+
+3.5  ftrace_run_update_code()          — kernel/trace/ftrace.c
+     Patches function entry stubs for function tracing (mcount → call ftrace).
+     Called when tracing is enabled/disabled or filters change.
+
+3.6  cpu_up() / _cpu_up()             — kernel/cpu.c  (CPU hotplug)
+     The final step of bringing a CPU online requires a stop_machine fence
+     to synchronise the hotplug state machine with all running CPUs.
+
+3.7  cpu_down() / _cpu_down()         — kernel/cpu.c  (CPU hotplug)
+     Similarly, taking a CPU offline uses stop_machine to drain and freeze
+     the system state before the CPU is parked.
+
+3.8  Module load / unload             — kernel/module/core.c
+     After relocations are applied, module text is patched for alternatives,
+     static calls, and jump labels — all via stop_machine.
+
+3.9  kpatch / livepatch consistency patch
+                                        — kernel/livepatch/patch.c
+     klp_patch_object() uses stop_machine to atomically flip all patched
+     function pointers while all CPUs are frozen.
+
+3.10 perf_pmu_migrate_context()       — kernel/events/core.c
+     Migrates a hardware PMU context to another CPU (e.g. CPU offline drain).
+
+3.11 Speculation mitigations (boot)   — arch/x86/kernel/cpu/bugs.c
+     Patching retpoline, IBRS, STIBP, MDS, TAA, SRBDS mitigations uses
+     apply_alternatives() → stop_machine at boot.
+
+3.12 KGDB / KGDB-over-kprobes breakpoints
+     Inserting/removing breakpoints while the system is live uses
+     stop_machine to ensure consistency.
+
+
+CATEGORY 4 — CPU HOTPLUG THREAD SYNC
+--------------------------------------
+Callback: various cpuhp_* callbacks
+Source:   kernel/cpu.c, kernel/smpboot.c
+
+4.1  stop_machine_park() / stop_machine_unpark()
+     Called when a CPU is parked (going offline) or unparked (coming online).
+     Disables/re-enables the stopper thread itself on the target CPU.
+
+4.2  cpuhp_kick_ap_work()
+     The hotplug state machine sends work items through the stopper to
+     advance a target CPU through its hotplug states (ONLINE → DEAD, etc.)
+     while the control CPU waits for acknowledgement.
+     API used: stop_one_cpu()
+
+
+CATEGORY 5 — MEMORY / MM OPERATIONS
+--------------------------------------
+
+5.1  migrate_pages() with MIGRATE_SYNC_NO_COPY      — mm/migrate.c
+     When page migration cannot be done passively (e.g. anonymous pages
+     on a NUMA node), the stopper is used to freeze the owning CPU while
+     the copy happens.
+     API used: stop_one_cpu() [rare, platform-specific]
+
+5.2  mprotect() / change_protection() on TLB-lazy CPUs
+     Some architectures (arm64 with ASID-based TLB) use stop_one_cpu to
+     force a remote TLB invalidation when lazy TLB shootdowns are not safe.
+
+
+CATEGORY 6 — HARDWARE / DRIVER USE
+-------------------------------------
+
+6.1  CPU frequency transitions (cpufreq)
+     Some legacy cpufreq drivers (e.g. acpi-cpufreq on older x86) use
+     stop_machine to ensure no task is executing on the target CPU during
+     a P-state change.
+
+6.2  CPU topology / SMT control
+     echo 0 > /sys/devices/system/cpu/smt/control uses stop_machine to
+     offline SMT siblings safely.
+     Source: arch/x86/kernel/cpu/bugs.c (cpu_smt_disable)
+
+6.3  Intel SGX EPC page reclaimer         — arch/x86/kernel/cpu/sgx/
+     Reclaims EPC pages while the owning enclave thread is frozen via stopper.
+
+6.4  IOMMU domain attach/detach (rare)
+     Some IOMMU drivers use stop_machine when switching a device's page
+     table pointer to prevent DMA while CPUs hold stale TLB entries.
+
+
+CATEGORY 7 — DEBUGGING / INSTRUMENTATION
+------------------------------------------
+
+7.1  kprobes arm/disarm               — kernel/kprobes.c
+     On x86, placing or removing a kprobe breakpoint byte uses
+     text_poke_bp() → stop_machine for the consistency step.
+
+7.2  uprobe installation              — kernel/events/uprobes.c
+     Setting a userspace probe on a shared mapping uses stop_machine to
+     patch the instruction page while all CPUs are frozen.
+
+7.3  BPF JIT trampoline patching      — kernel/bpf/trampoline.c
+     Attaching/detaching BPF programs to kernel functions via fentry/fexit
+     trampolines uses text_poke / stop_machine on x86.
+
+7.4  Ftrace direct callers (BPF, fentry)
+     register_ftrace_direct() patches a direct-call trampoline site and
+     uses ftrace_run_update_code() → stop_machine.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SUMMARY TABLE
+-------------
+
+Category                     | Callback fn                    | API
+-----------------------------|--------------------------------|----------------------------
+Task migration (exec)        | migration_cpu_stop             | stop_one_cpu
+Task migration (affinity)    | migration_cpu_stop             | stop_one_cpu
+Task migration (explicit)    | migration_cpu_stop             | stop_one_cpu
+Task drain (CPU offline)     | migration_cpu_stop             | stop_one_cpu
+RT push/pull                 | rt balancer internal           | stop_one_cpu_nowait
+DL push/pull                 | dl balancer internal           | stop_one_cpu_nowait
+CFS active load balance      | active_load_balance_cpu_stop   | stop_one_cpu_nowait
+Global freeze (patching)     | multi_cpu_stop                 | stop_machine / stop_two_cpus
+CPU hotplug sync             | cpuhp callbacks                | stop_one_cpu
+NUMA page migration          | mm internal                    | stop_one_cpu (rare)
+Driver / HW critical section | driver-specific                | stop_machine
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BOOT-TIME IMPACT (most significant stop_machine callers during boot)
+---------------------------------------------------------------------
+
+In order of typical wall-clock cost on a multi-core SoC:
+
+ 1. apply_alternatives()     — patches every alternative block; scales with
+                               CPU count (all CPUs frozen per call).
+ 2. jump_label_update_all()  — one stop_machine per changed static key.
+ 3. ftrace_run_update_code() — if ftrace is enabled early.
+ 4. static_call_update()     — called for each static_call site touched.
+ 5. Module loading            — each module triggers alternatives + jump labels.
+ 6. cpu_up() per CPU         — N-1 stop_machine calls for N-core system.
+
+Tooling to measure: see drivers/misc/boot_kpi.c (boot_kpi module) and
+                    drivers/misc/migration_tracer.c (migration_tracer module).
+Debugfs output:     /sys/kernel/debug/boot_kpi/summary
+                    /sys/kernel/debug/migration_tracer/multi_stop/history
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

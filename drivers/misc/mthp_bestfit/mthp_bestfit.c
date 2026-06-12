@@ -40,13 +40,14 @@
 #include <linux/bitops.h>
 #include <linux/atomic.h>
 #include <linux/jiffies.h>
+#include <linux/swap.h>
 
 #include <trace/hooks/mm.h>
 
 #include "profile.h"
 
 #define MOD_NAME	"mthp_bestfit"
-#define MOD_VER		"4.1"
+#define MOD_VER		"4.2"
 
 MODULE_SOFTDEP("pre: mthp_monitor");
 
@@ -57,6 +58,10 @@ MODULE_SOFTDEP("pre: mthp_monitor");
 #else
 # define CONTPTE_ORDER 0
 #endif
+
+/* Hard ceiling: never select 2 MB (PMD) folios. Sysfs already sets
+ * hugepages-2048kB=never; this enforces it in the module too. */
+#define MAX_BF_ORDER  (PMD_ORDER - 1)
 
 /* -- VMA type classification --------------------------------------------- */
 #define BF_VMA_STACK	0
@@ -215,7 +220,7 @@ static void bf_recompute_shape(void)
 	int k, j, top;
 	u64 sum;
 
-	for (k = 0; k <= PMD_ORDER; k++) {
+	for (k = 0; k <= MAX_BF_ORDER; k++) {
 		raw[k] = (u32)min(bf_order_free_count(k),
 				  (unsigned long)U32_MAX);
 		WRITE_ONCE(bf_free_raw[k], raw[k]);
@@ -370,8 +375,8 @@ static int mthp_bestfit_order(struct vm_area_struct *vma,
 	 * The size reject above guarantees geo >= 2.
 	 */
 	geo_order = fls_long(vma_size / min_pages) - 1 - PAGE_SHIFT;
-	if (geo_order >= PMD_ORDER)
-		return PMD_ORDER;	/* PMD-eligible: bypass, sysfs owns PMD */
+	if (geo_order >= MAX_BF_ORDER)
+		geo_order = MAX_BF_ORDER;
 
 	ceiling = geo_order;
 
@@ -467,6 +472,18 @@ static unsigned long __mthp_bestfit_mask(struct vm_area_struct *vma,
 	if (!(allowed_orders & (BIT(PMD_ORDER) - 1)))
 		return allowed_orders;
 
+	/* Real MemAvailable gate: if the system is genuinely low on
+	 * free+reclaimable memory, don't attempt any large folio — fall
+	 * back to base pages. */
+	if (READ_ONCE(sysctl_mthp_bestfit_pressure_aware)) {
+		unsigned long avail = si_mem_available();
+		unsigned long min_avail = (unsigned long)
+			READ_ONCE(sysctl_mthp_bestfit_pressure_min) << (20 - PAGE_SHIFT);
+
+		if (avail < min_avail)
+			return 0;
+	}
+
 	bf_maybe_refresh();
 
 	best = mthp_bestfit_order(vma, allowed_orders, &vtype, &f);
@@ -476,8 +493,8 @@ static unsigned long __mthp_bestfit_mask(struct vm_area_struct *vma,
 
 	bestfit_count(best, vtype, &f);
 
-	if (best >= PMD_ORDER)
-		return allowed_orders;
+	if (best >= MAX_BF_ORDER)
+		return allowed_orders & ~BIT(PMD_ORDER);
 
 	if (READ_ONCE(sysctl_mthp_bestfit_dry_run))
 		return allowed_orders;
@@ -527,6 +544,8 @@ static struct ctl_table mthp_bestfit_sysctls[] = {
 	BF_CTL("frag_cap_pct",	   sysctl_mthp_bestfit_frag_cap,      &bf_int_zero, &bf_frag_cap_max),
 	BF_CTL("exec_boost",	   sysctl_mthp_bestfit_exec_boost,    &bf_int_zero, &bf_int_one),
 	BF_CTL("pressure_aware",   sysctl_mthp_bestfit_pressure_aware,&bf_int_zero, &bf_int_one),
+	/* pressure_min_free: minimum MemAvailable in MB (si_mem_available()
+	 * gate); below this, no large folio is attempted at all. */
 	BF_CTL("pressure_min_free",sysctl_mthp_bestfit_pressure_min,  &bf_int_one,  &bf_pressure_min_max),
 	BF_CTL("dry_run",	   sysctl_mthp_bestfit_dry_run,	      &bf_int_zero, &bf_int_one),
 	BF_CTL("lifetime_aware",   sysctl_mthp_bestfit_lifetime_aware,&bf_int_zero, &bf_int_one),
@@ -613,6 +632,9 @@ static int bestfit_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "refresh_ms:     %d (self-clocked)   herd_guard: %d\n",
 		   sysctl_mthp_bestfit_refresh_ms,
 		   sysctl_mthp_bestfit_herd_guard);
+	seq_printf(m, "pressure:       aware=%d min_avail=%d MB (si_mem_available gate)\n",
+		   sysctl_mthp_bestfit_pressure_aware,
+		   sysctl_mthp_bestfit_pressure_min);
 	seq_printf(m, "eligible:       exact=0x%03x bounded=0x%03x\n",
 		   (u32)elig & 0xffff, (u32)(elig >> 32) & 0xffff);
 	seq_printf(m, "monitor active: %s\n",

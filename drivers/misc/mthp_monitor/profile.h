@@ -23,6 +23,7 @@ struct system_info {
 	 */
 	u64		buddy_free[MAX_TRACKED_ORDER];
 	unsigned long	total_pages;
+	unsigned long	mem_available;	/* si_mem_available() snapshot */
 	unsigned int	frag_index;	/* (total - free) * 100 / total */
 };
 

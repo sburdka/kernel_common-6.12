@@ -12,11 +12,11 @@
  *
  * Pairing note: mthp_bestfit >= v4.0 sources per-order buddy data
  * locally and consumes only frag_index from mthp_monitor_get_sysinfo();
- * buddy_free[] in the exported struct stays at the INT_MAX
- * "unavailable" sentinel (first_online_pgdat()/next_zone() are not
- * exported to modules on GKI or mainline). The monitor remains useful
- * standalone for slab-leak watching, THP-split counting, and the
- * sysfs/debugfs fragmentation view.
+ * buddy_free[] is filled with real per-order counts read directly from
+ * NODE_DATA(0)'s zones (same walk mthp_bestfit uses; first_online_pgdat()
+ * /next_zone() are not exported, but NODE_DATA(0) is reachable). The
+ * monitor remains useful standalone for slab-leak watching, THP-split
+ * counting, and the sysfs/debugfs fragmentation view.
  */
 
 #include <linux/module.h>
@@ -24,6 +24,7 @@
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/mmzone.h>
 #include <linux/vmstat.h>
 #include <linux/swap.h>
 #include <linux/workqueue.h>
@@ -43,7 +44,7 @@
 #include "profile.h"
 
 #define MOD_NAME	"mthp_monitor"
-#define MOD_VER		"3.1"
+#define MOD_VER		"3.2"
 
 /* ---- Config ------------------------------------------------------------ */
 
@@ -76,14 +77,6 @@ static void buddy_update_work(struct work_struct *work)
 	unsigned int frag;
 	int order;
 
-	/*
-	 * first_online_pgdat() and next_zone() are not exported to modules
-	 * (GKI and mainline alike: mm/mmzone.c carries no EXPORT_SYMBOL),
-	 * so zone->free_area[order].nr_free cannot be read from here. Use
-	 * vmstat exports instead: totalram_pages() is an inline helper (no
-	 * export needed) and global_zone_page_state(NR_FREE_PAGES) is
-	 * exported.
-	 */
 	total_pages = totalram_pages();
 	free_pages = global_zone_page_state(NR_FREE_PAGES);
 
@@ -93,20 +86,28 @@ static void buddy_update_work(struct work_struct *work)
 			       total_pages) : 0;
 
 	write_seqlock(&g_buddy_lock);
+	/*
+	 * Real per-order free counts, read directly from NODE_DATA(0)'s
+	 * zones (same racy-but-safe walk mthp_bestfit uses). nr_free sums
+	 * all migratetypes and excludes per-CPU lists; good enough for
+	 * monitoring.
+	 */
 	for (order = 0; order < MAX_TRACKED_ORDER; order++) {
-		/*
-		 * buddy_free[] is set to INT_MAX to signal "data
-		 * unavailable", which disables mthp_bestfit's legacy
-		 * buddy_guard safely: the guard fires only when
-		 * free_at < guard_min; INT_MAX satisfies free_at >=
-		 * guard_min for any reasonable guard_min value.
-		 * bestfit >= v4.0 ignores this array entirely.
-		 */
-		g_buddy_free[order] = (unsigned long)INT_MAX;
-		g_system_info.buddy_free[order] = (u64)INT_MAX;
+		unsigned long cnt = 0;
+		int z;
+
+		for (z = 0; z < MAX_NR_ZONES; z++) {
+			struct zone *zone = &NODE_DATA(0)->node_zones[z];
+
+			if (populated_zone(zone))
+				cnt += READ_ONCE(zone->free_area[order].nr_free);
+		}
+		g_buddy_free[order] = cnt;
+		g_system_info.buddy_free[order] = (u64)cnt;
 	}
 	g_system_info.frag_index = frag;
 	g_system_info.total_pages = total_pages;
+	g_system_info.mem_available = si_mem_available();
 	write_sequnlock(&g_buddy_lock);
 
 	atomic64_set(&g_pages_in_use,
@@ -271,8 +272,13 @@ static struct dentry *dbg_dir;
 
 static int dbg_stats_show(struct seq_file *m, void *v)
 {
+	int order;
+
 	seq_printf(m, "=== %s v%s ===\n\n", MOD_NAME, MOD_VER);
-	seq_puts(m, "Buddy free blocks: (per-order data unavailable on this build)\n");
+	seq_puts(m, "Buddy free blocks (per-order):\n");
+	for (order = 0; order < MAX_TRACKED_ORDER; order++)
+		seq_printf(m, "  order %d: %lu blocks\n", order,
+			   g_buddy_free[order]);
 	seq_printf(m, "Frag index: %u%% (utilization: total-free/total)\n",
 		   g_system_info.frag_index);
 	seq_printf(m, "Pages in use: %lld\n",

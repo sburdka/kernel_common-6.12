@@ -47,7 +47,7 @@
 #include "profile.h"
 
 #define MOD_NAME	"mthp_bestfit"
-#define MOD_VER		"4.2"
+#define MOD_VER		"4.3"
 
 MODULE_SOFTDEP("pre: mthp_monitor");
 
@@ -58,10 +58,6 @@ MODULE_SOFTDEP("pre: mthp_monitor");
 #else
 # define CONTPTE_ORDER 0
 #endif
-
-/* Hard ceiling: never select 2 MB (PMD) folios. Sysfs already sets
- * hugepages-2048kB=never; this enforces it in the module too. */
-#define MAX_BF_ORDER  (PMD_ORDER - 1)
 
 /* -- VMA type classification --------------------------------------------- */
 #define BF_VMA_STACK	0
@@ -99,6 +95,10 @@ static int sysctl_mthp_bestfit_refresh_ms	__read_mostly = 100;
 /* v4.1 */
 static int sysctl_mthp_bestfit_strict_mask	__read_mostly = 1;
 static int sysctl_mthp_bestfit_herd_guard	__read_mostly = 1;
+/* v4.3: PMD eligibility threshold — buddy must have >= pmd_min_blocks
+ * free 2 MB blocks before PMD is selected. Higher than exact_min_blocks
+ * because each 2 MB block is order-7 times costlier than a 16 KB block. */
+static int sysctl_mthp_bestfit_pmd_min		__read_mostly = 16;
 
 static int bf_int_zero		= 0;
 static int bf_int_one		= 1;
@@ -110,6 +110,7 @@ static int bf_exact_min_max	= 4096;
 static int bf_slack_max		= 4;
 static int bf_refresh_ms_min	= 50;
 static int bf_refresh_ms_max	= 5000;
+static int bf_pmd_min_max	= 65536;
 
 /* -- per-CPU statistics ---------------------------------------------------- */
 struct bestfit_counters {
@@ -220,7 +221,7 @@ static void bf_recompute_shape(void)
 	int k, j, top;
 	u64 sum;
 
-	for (k = 0; k <= MAX_BF_ORDER; k++) {
+	for (k = 0; k <= PMD_ORDER; k++) {
 		raw[k] = (u32)min(bf_order_free_count(k),
 				  (unsigned long)U32_MAX);
 		WRITE_ONCE(bf_free_raw[k], raw[k]);
@@ -237,6 +238,11 @@ static void bf_recompute_shape(void)
 		if (sum >= want)
 			bounded |= BIT(k);
 	}
+
+	/* PMD: exact-fit only (no bounded-fit — there is nothing larger to
+	 * split down from). Requires pmd_min_blocks free 2 MB buddy blocks. */
+	if (raw[PMD_ORDER] >= (u32)READ_ONCE(sysctl_mthp_bestfit_pmd_min))
+		exact |= BIT(PMD_ORDER);
 
 	WRITE_ONCE(bf_eligible, ((u64)bounded << 32) | exact);
 
@@ -375,8 +381,8 @@ static int mthp_bestfit_order(struct vm_area_struct *vma,
 	 * The size reject above guarantees geo >= 2.
 	 */
 	geo_order = fls_long(vma_size / min_pages) - 1 - PAGE_SHIFT;
-	if (geo_order >= MAX_BF_ORDER)
-		geo_order = MAX_BF_ORDER;
+	if (geo_order > PMD_ORDER)
+		geo_order = PMD_ORDER;
 
 	ceiling = geo_order;
 
@@ -472,16 +478,16 @@ static unsigned long __mthp_bestfit_mask(struct vm_area_struct *vma,
 	if (!(allowed_orders & (BIT(PMD_ORDER) - 1)))
 		return allowed_orders;
 
-	/* Real MemAvailable gate: if the system is genuinely low on
-	 * free+reclaimable memory, don't attempt any large folio — fall
-	 * back to base pages. */
+	/* MemAvailable pressure gate: under memory pressure, suppress 2 MB
+	 * folios specifically (strip PMD from the candidate set) so sub-PMD
+	 * frag-fit still runs. Only a complete memory emergency returns 0. */
 	if (READ_ONCE(sysctl_mthp_bestfit_pressure_aware)) {
 		unsigned long avail = si_mem_available();
 		unsigned long min_avail = (unsigned long)
 			READ_ONCE(sysctl_mthp_bestfit_pressure_min) << (20 - PAGE_SHIFT);
 
 		if (avail < min_avail)
-			return 0;
+			allowed_orders &= ~BIT(PMD_ORDER);
 	}
 
 	bf_maybe_refresh();
@@ -492,9 +498,6 @@ static unsigned long __mthp_bestfit_mask(struct vm_area_struct *vma,
 		return allowed_orders;
 
 	bestfit_count(best, vtype, &f);
-
-	if (best >= MAX_BF_ORDER)
-		return allowed_orders & ~BIT(PMD_ORDER);
 
 	if (READ_ONCE(sysctl_mthp_bestfit_dry_run))
 		return allowed_orders;
@@ -545,7 +548,7 @@ static struct ctl_table mthp_bestfit_sysctls[] = {
 	BF_CTL("exec_boost",	   sysctl_mthp_bestfit_exec_boost,    &bf_int_zero, &bf_int_one),
 	BF_CTL("pressure_aware",   sysctl_mthp_bestfit_pressure_aware,&bf_int_zero, &bf_int_one),
 	/* pressure_min_free: minimum MemAvailable in MB (si_mem_available()
-	 * gate); below this, no large folio is attempted at all. */
+	 * gate); below this, PMD folios are suppressed. */
 	BF_CTL("pressure_min_free",sysctl_mthp_bestfit_pressure_min,  &bf_int_one,  &bf_pressure_min_max),
 	BF_CTL("dry_run",	   sysctl_mthp_bestfit_dry_run,	      &bf_int_zero, &bf_int_one),
 	BF_CTL("lifetime_aware",   sysctl_mthp_bestfit_lifetime_aware,&bf_int_zero, &bf_int_one),
@@ -555,6 +558,7 @@ static struct ctl_table mthp_bestfit_sysctls[] = {
 	BF_CTL("refresh_ms",	   sysctl_mthp_bestfit_refresh_ms,    &bf_refresh_ms_min, &bf_refresh_ms_max),
 	BF_CTL("strict_mask",	   sysctl_mthp_bestfit_strict_mask,   &bf_int_zero, &bf_int_one),
 	BF_CTL("herd_guard",	   sysctl_mthp_bestfit_herd_guard,    &bf_int_zero, &bf_int_one),
+	BF_CTL("pmd_min_blocks",   sysctl_mthp_bestfit_pmd_min,       &bf_int_zero, &bf_pmd_min_max),
 };
 
 static struct ctl_table_header *mthp_bestfit_sysctl_hdr;
@@ -632,9 +636,11 @@ static int bestfit_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "refresh_ms:     %d (self-clocked)   herd_guard: %d\n",
 		   sysctl_mthp_bestfit_refresh_ms,
 		   sysctl_mthp_bestfit_herd_guard);
-	seq_printf(m, "pressure:       aware=%d min_avail=%d MB (si_mem_available gate)\n",
+	seq_printf(m, "pressure:       aware=%d min_avail=%d MB (PMD suppressed below this)\n",
 		   sysctl_mthp_bestfit_pressure_aware,
 		   sysctl_mthp_bestfit_pressure_min);
+	seq_printf(m, "pmd_min_blocks: %d (free 2MB buddy blocks needed for PMD selection)\n",
+		   sysctl_mthp_bestfit_pmd_min);
 	seq_printf(m, "eligible:       exact=0x%03x bounded=0x%03x\n",
 		   (u32)elig & 0xffff, (u32)(elig >> 32) & 0xffff);
 	seq_printf(m, "monitor active: %s\n",
@@ -735,6 +741,7 @@ static int bestfit_live_show(struct seq_file *m, void *v)
 	seq_printf(m, "frag_fit %d\n", sysctl_mthp_bestfit_frag_fit);
 	seq_printf(m, "strict_mask %d\n", sysctl_mthp_bestfit_strict_mask);
 	seq_printf(m, "herd_guard %d\n", sysctl_mthp_bestfit_herd_guard);
+	seq_printf(m, "pmd_min_blocks %d\n", sysctl_mthp_bestfit_pmd_min);
 	seq_printf(m, "exact_bm 0x%03x\n", (u32)elig & 0xffff);
 	seq_printf(m, "bounded_bm 0x%03x\n", (u32)(elig >> 32) & 0xffff);
 	for (i = 2; i <= PMD_ORDER; i++)
@@ -881,12 +888,13 @@ static int __init mthp_bestfit_init(void)
 
 	pr_info(MOD_NAME " v%s loaded (PMD_ORDER=%d CONTPTE_ORDER=%d "
 		"frag_fit=%d strict_mask=%d herd_guard=%d exact_min=%d "
-		"slack=%d refresh=%dms self-clocked)\n",
+		"pmd_min=%d slack=%d refresh=%dms self-clocked)\n",
 		MOD_VER, PMD_ORDER, CONTPTE_ORDER,
 		sysctl_mthp_bestfit_frag_fit,
 		sysctl_mthp_bestfit_strict_mask,
 		sysctl_mthp_bestfit_herd_guard,
 		sysctl_mthp_bestfit_exact_min,
+		sysctl_mthp_bestfit_pmd_min,
 		sysctl_mthp_bestfit_split_slack,
 		sysctl_mthp_bestfit_refresh_ms);
 	return 0;
